@@ -1,0 +1,21 @@
+namespace: default
+
+images:
+  gateway: chivas1786/gateway:latest
+  userService: chivas1786/user-service:latest
+  libraryService: chivas1786/library-service:latest
+  reservationService: chivas1786/reservation-service:latest
+
+services:
+  gateway:
+    port: 8080
+  userService:
+    port: 8050
+  libraryService:
+    port: 8060
+  reservationService:
+    port: 8070
+
+postgres:
+  image: library/postgres:13
+  port: 5432

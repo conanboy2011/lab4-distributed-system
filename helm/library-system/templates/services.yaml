@@ -1,0 +1,318 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  10-create-user.sql: |
+    CREATE ROLE program WITH PASSWORD 'test';
+    ALTER ROLE program WITH LOGIN;
+
+  20-create-databases.sh: |
+    #!/usr/bin/env bash
+    set -e
+
+    export VARIANT="v4"
+    export SCRIPT_PATH=/docker-entrypoint-initdb.d/
+    export PGPASSWORD=postgres
+
+    psql -f "$SCRIPT_PATH/scripts/db-$VARIANT.sql"
+    psql -d libraries -f "$SCRIPT_PATH/scripts/seed-v4-libraries.sql"
+
+  db-v4.sql: |
+    CREATE DATABASE reservations;
+    GRANT ALL PRIVILEGES ON DATABASE reservations TO program;
+
+    CREATE DATABASE libraries;
+    GRANT ALL PRIVILEGES ON DATABASE libraries TO program;
+
+    CREATE DATABASE ratings;
+    GRANT ALL PRIVILEGES ON DATABASE ratings TO program;
+
+  seed-v4-libraries.sql: |
+    CREATE TABLE IF NOT EXISTS library (
+        id SERIAL PRIMARY KEY,
+        library_uid uuid UNIQUE NOT NULL,
+        name VARCHAR(80) NOT NULL,
+        city VARCHAR(255) NOT NULL,
+        address VARCHAR(255) NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS books (
+        id SERIAL PRIMARY KEY,
+        book_uid uuid UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        author VARCHAR(255),
+        genre VARCHAR(255),
+        condition VARCHAR(20) DEFAULT 'EXCELLENT'
+            CHECK (condition IN ('EXCELLENT','GOOD','BAD'))
+    );
+
+    CREATE TABLE IF NOT EXISTS library_books (
+        book_id INT REFERENCES books(id),
+        library_id INT REFERENCES library(id),
+        available_count INT NOT NULL
+    );
+
+    INSERT INTO library (id, library_uid, name, city, address)
+    VALUES (
+        1,
+        '83575e12-7ce0-48ee-9931-51919ff3c9ee',
+        'Библиотека имени 7 Непьющих',
+        'Москва',
+        '2-я Бауманская ул., д.5, стр.1'
+    )
+    ON CONFLICT (library_uid) DO NOTHING;
+
+    INSERT INTO books (id, book_uid, name, author, genre, condition)
+    VALUES (
+        1,
+        'f7cdc58f-2caf-4b15-9727-f89dcc629b27',
+        'Краткий курс C++ в 7 томах',
+        'Бьерн Страуструп',
+        'Научная фантастика',
+        'EXCELLENT'
+    )
+    ON CONFLICT (book_uid) DO NOTHING;
+
+    INSERT INTO library_books (book_id, library_id, available_count)
+    VALUES (1, 1, 1)
+    ON CONFLICT DO NOTHING;
+
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO program;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO program;
+    GRANT USAGE, CREATE ON SCHEMA public TO program;
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: library/postgres:13
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: postgres
+          volumeMounts:
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d/10-create-user.sql
+              subPath: 10-create-user.sql
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d/20-create-databases.sh
+              subPath: 20-create-databases.sh
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d/scripts/db-v4.sql
+              subPath: db-v4.sql
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d/scripts/seed-v4-libraries.sql
+              subPath: seed-v4-libraries.sql
+      volumes:
+        - name: postgres-init
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+        - name: user-service
+          image: {{ .Values.images.userService }}
+          ports:
+            - containerPort: {{ .Values.services.userService.port }}
+          env:
+            - name: DB_URL
+              value: postgresql://program:test@postgres:5432/ratings
+          readinessProbe:
+            httpGet:
+              path: /manage/health
+              port: {{ .Values.services.userService.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 5
+            successThreshold: 1
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: {{ .Values.services.userService.port }}
+      targetPort: {{ .Values.services.userService.port }}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: library-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: library-service
+  template:
+    metadata:
+      labels:
+        app: library-service
+    spec:
+      containers:
+        - name: library-service
+          image: {{ .Values.images.libraryService }}
+          ports:
+            - containerPort: {{ .Values.services.libraryService.port }}
+          env:
+            - name: DB_URL
+              value: postgresql://program:test@postgres:5432/libraries
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: library-service
+spec:
+  selector:
+    app: library-service
+  ports:
+    - port: {{ .Values.services.libraryService.port }}
+      targetPort: {{ .Values.services.libraryService.port }}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reservation-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reservation-service
+  template:
+    metadata:
+      labels:
+        app: reservation-service
+    spec:
+      containers:
+        - name: reservation-service
+          image: {{ .Values.images.reservationService }}
+          ports:
+            - containerPort: {{ .Values.services.reservationService.port }}
+          env:
+            - name: DB_URL
+              value: postgresql://program:test@postgres:5432/reservations
+            - name: TZ
+              value: Europe/Moscow
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reservation-service
+spec:
+  selector:
+    app: reservation-service
+  ports:
+    - port: {{ .Values.services.reservationService.port }}
+      targetPort: {{ .Values.services.reservationService.port }}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: {{ .Values.images.gateway }}
+          ports:
+            - containerPort: {{ .Values.services.gateway.port }}
+          env:
+            - name: RATING_SERVICE_URL
+              value: http://user-service:8050
+            - name: LIBRARY_SERVICE_URL
+              value: http://library-service:8060
+            - name: RESERVATION_SERVICE_URL
+              value: http://reservation-service:8070
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: {{ .Values.services.gateway.port }}
+      targetPort: {{ .Values.services.gateway.port }}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
